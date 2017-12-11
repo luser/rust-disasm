@@ -1,20 +1,20 @@
 extern crate addr2line;
 extern crate capstone;
 extern crate goblin;
+extern crate object;
+extern crate memmap;
 
 #[macro_use] extern crate failure;
 
 use addr2line::Mapping;
 use capstone::{Arch, Capstone, NO_EXTRA_MODE, Mode};
 use failure::Error;
-use goblin::Object;
-use goblin::mach::{Mach, MachO};
 use goblin::mach::constants::SECT_TEXT;
-use goblin::mach::constants::cputype;
+use object::{Machine, Object, ObjectSection};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Fail)]
@@ -25,6 +25,8 @@ pub enum DisasmError {
     BadFilename { filename: PathBuf },
     #[fail(display = "addr2line error")]
     Addr2Line,
+    #[fail(display = "Error parsing object file: {}", reason)]
+    Object { reason: &'static str },
 }
 
 #[derive(Debug, PartialEq)]
@@ -37,15 +39,6 @@ impl<'a> PartialEq<(&'a Path, u64)> for SourceLocation {
     fn eq(&self, other: &(&'a Path, u64)) -> bool {
         return self.file == other.0 && self.line == other.1;
     }
-}
-
-fn read_file<P>(path: P) -> io::Result<Vec<u8>>
-    where P: AsRef<Path>,
-{
-    let mut f = File::open(path)?;
-    let mut buffer = Vec::new();
-    f.read_to_end(&mut buffer)?;
-    Ok(buffer)
 }
 
 fn read_file_lines<P>(path: P) -> io::Result<Vec<String>>
@@ -86,50 +79,49 @@ fn locate_dsym(path: &Path) -> Result<Option<PathBuf>, Error> {
     }
 }
 
-fn parse_mach<'a>(mach: &MachO<'a>, path: &Path) -> Result<(), Error> {
+fn disasm_sections<'a>(obj: &object::File<'a>, path: &Path) -> Result<(), Error> {
+    //TODO: only do this for Mach-O binaries
     let dsym = locate_dsym(path)?;
     let debug_file = dsym.as_ref().map(|d| d.as_ref()).unwrap_or(path);
-    let (arch, mode) = match mach.header.cputype {
-        cputype::CPU_TYPE_X86 => (Arch::X86, Mode::Mode32),
-        cputype::CPU_TYPE_X86_64 => (Arch::X86, Mode::Mode64),
+    let (arch, mode) = match obj.machine() {
+        Machine::X86 => (Arch::X86, Mode::Mode32),
+        Machine::X86_64 => (Arch::X86, Mode::Mode64),
         _ => unimplemented!(),
     };
     let mut map = Mapping::new(debug_file).or(Err(DisasmError::Addr2Line))?;
     let mut source_lines = HashMap::new();
-    for seg in mach.segments.iter() {
-        for (sect, data) in seg.sections()? {
-            let name = sect.name()?;
-            if name == SECT_TEXT {
-                println!("Disassembly of section {}:", name);
-                let cs = Capstone::new_raw(arch, mode, NO_EXTRA_MODE, None)?;
-                let mut last_loc: Option<SourceLocation> = None;
-                for i in cs.disasm_all(data, sect.addr)?.iter() {
-                    let loc = map.locate(i.address()).or(Err(DisasmError::Addr2Line))?;
-                    if let Some((file, Some(line), _)) = loc {
-                        let this_loc = SourceLocation { file, line };
-                        match last_loc {
-                            None => {
+    for sect in obj.sections() {
+        let name = sect.name().unwrap_or("<unknown>");
+        if name == SECT_TEXT {
+            println!("Disassembly of section {}:", name);
+            let cs = Capstone::new_raw(arch, mode, NO_EXTRA_MODE, None)?;
+            let mut last_loc: Option<SourceLocation> = None;
+            for i in cs.disasm_all(sect.data(), sect.address())?.iter() {
+                let loc = map.locate(i.address()).or(Err(DisasmError::Addr2Line))?;
+                if let Some((file, Some(line), _)) = loc {
+                    let this_loc = SourceLocation { file, line };
+                    match last_loc {
+                        None => {
+                            println!("{}", this_loc.file.to_string_lossy());
+                            print_source_line(&this_loc, &mut source_lines)?;
+                        }
+                        Some(ref last) => {
+                            if last.file != this_loc.file {
                                 println!("{}", this_loc.file.to_string_lossy());
+                            }
+                            if last.line != this_loc.line {
                                 print_source_line(&this_loc, &mut source_lines)?;
                             }
-                            Some(ref last) => {
-                                if last.file != this_loc.file {
-                                    println!("{}", this_loc.file.to_string_lossy());
-                                }
-                                if last.line != this_loc.line {
-                                    print_source_line(&this_loc, &mut source_lines)?;
-                                }
 
-                            }
                         }
-                        last_loc = Some(this_loc);
-                    } else {
-                        last_loc = None;
                     }
-                    println!("{}", i);
+                    last_loc = Some(this_loc);
+                } else {
+                    last_loc = None;
                 }
-                println!("");
+                println!("{}", i);
             }
+            println!("");
         }
     }
     Ok(())
@@ -138,28 +130,12 @@ fn parse_mach<'a>(mach: &MachO<'a>, path: &Path) -> Result<(), Error> {
 pub fn disasm<P>(path: P) -> Result<(), Error>
     where P: AsRef<Path>,
 {
-    let buf = read_file(path.as_ref())?;
-    match Object::parse(&buf)? {
-        Object::Elf(_elf) => {
-            unimplemented!()
-        },
-        Object::PE(_pe) => {
-            unimplemented!()
-        },
-        Object::Mach(mach) => {
-            match mach {
-                Mach::Fat(_fat) => unimplemented!(),
-                Mach::Binary(mach) => parse_mach(&mach, path.as_ref())?,
-            }
-        },
-        Object::Archive(_archive) => {
-            unimplemented!()
-        },
-        Object::Unknown(_magic) => {
-            unimplemented!()
-        }
-    }
-    Ok(())
+    let path = path.as_ref();
+    let f = File::open(path)?;
+    let buf = unsafe { memmap::Mmap::map(&f)? };
+
+    let obj = object::File::parse(&*buf).map_err(|e| DisasmError::Object { reason: e } )?;
+    disasm_sections(&obj, path)
 }
 
 #[cfg(test)]
