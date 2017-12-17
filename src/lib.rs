@@ -1,6 +1,7 @@
 extern crate addr2line;
 extern crate capstone;
 extern crate goblin;
+extern crate moria;
 extern crate object;
 extern crate memmap;
 
@@ -66,29 +67,18 @@ fn print_source_line(loc: &SourceLocation, source_lines: &mut HashMap<PathBuf, V
     Ok(())
 }
 
-
-fn locate_dsym(path: &Path) -> Result<Option<PathBuf>, Error> {
-    let filename = path.file_name().ok_or(DisasmError::BadFilename { filename: path.to_owned() })?;
-    let mut dsym = filename.to_owned();
-    dsym.push(".dSYM");
-    let f = path.with_file_name(&dsym).join("Contents/Resources/DWARF").join(filename);
-    if f.exists() {
-        Ok(Some(f))
-    } else {
-        Ok(None)
-    }
-}
-
 fn disasm_sections<'a>(obj: &object::File<'a>, path: &Path) -> Result<(), Error> {
-    //TODO: only do this for Mach-O binaries
-    let dsym = locate_dsym(path)?;
-    let debug_file = dsym.as_ref().map(|d| d.as_ref()).unwrap_or(path);
     let (arch, mode) = match obj.machine() {
         Machine::X86 => (Arch::X86, Mode::Mode32),
         Machine::X86_64 => (Arch::X86, Mode::Mode64),
         _ => unimplemented!(),
     };
-    let mut map = Mapping::new(debug_file).or(Err(DisasmError::Addr2Line))?;
+    let mut map = if obj.has_debug_symbols() {
+        Mapping::new(path).or(Err(DisasmError::Addr2Line))?
+    } else {
+        let debug_file = moria::locate_debug_symbols(obj, path)?;
+        Mapping::new(debug_file).or(Err(DisasmError::Addr2Line))?
+    };
     let mut source_lines = HashMap::new();
     for sect in obj.sections() {
         let name = sect.name().unwrap_or("<unknown>");
