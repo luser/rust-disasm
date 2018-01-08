@@ -53,15 +53,16 @@ fn read_file_lines<P>(path: P) -> io::Result<Vec<String>>
     Ok(lines)
 }
 
-fn print_source_line(loc: &SourceLocation, source_lines: &mut HashMap<PathBuf, Vec<String>>) -> Result<(), Error> {
-    let lines = match source_lines.entry(loc.file.clone()) {
+fn print_source_line(loc: &SourceLocation, source_lines: &mut HashMap<PathBuf, Option<Vec<String>>>) -> Result<(), Error> {
+    if let &mut Some(ref lines) = match source_lines.entry(loc.file.clone()) {
         Entry::Occupied(o) => o.into_mut(),
         Entry::Vacant(v) => {
-            v.insert(read_file_lines(&loc.file)?)
+            v.insert(read_file_lines(&loc.file).ok())
         }
-    };
-    if loc.line < lines.len() as u64 {
-        println!("{:5} {}", loc.line, lines[loc.line as usize]);
+    } {
+        if loc.line < lines.len() as u64 {
+            println!("{:5} {}", loc.line, lines[loc.line as usize]);
+        }
     }
     Ok(())
 }
