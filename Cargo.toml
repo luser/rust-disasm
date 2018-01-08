@@ -10,5 +10,5 @@ capstone = "0.2.0"
 failure = "0.1.1"
 goblin = "0.0.13"
 memmap = "0.6.1"
-moria = { git = "https://github.com/luser/moria/", branch = "dsym" }
+moria = { git = "https://github.com/gimli-rs/moria/" }
 object = { git = "https://github.com/luser/object/", branch = "debug-symbols" }

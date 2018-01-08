@@ -10,8 +10,7 @@ extern crate memmap;
 use addr2line::Mapping;
 use capstone::{Arch, Capstone, NO_EXTRA_MODE, Mode};
 use failure::Error;
-use goblin::mach::constants::SECT_TEXT;
-use object::{Machine, Object, ObjectSection};
+use object::{Machine, Object, ObjectSection, SectionKind};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fs::File;
@@ -82,7 +81,7 @@ fn disasm_sections<'a>(obj: &object::File<'a>, path: &Path) -> Result<(), Error>
     let mut source_lines = HashMap::new();
     for sect in obj.sections() {
         let name = sect.name().unwrap_or("<unknown>");
-        if name == SECT_TEXT {
+        if sect.kind() == SectionKind::Text {
             println!("Disassembly of section {}:", name);
             let cs = Capstone::new_raw(arch, mode, NO_EXTRA_MODE, None)?;
             let mut last_loc: Option<SourceLocation> = None;
