@@ -1,13 +1,12 @@
 extern crate addr2line;
 extern crate capstone;
-extern crate goblin;
 extern crate moria;
 extern crate object;
 extern crate memmap;
 
 #[macro_use] extern crate failure;
 
-use addr2line::Mapping;
+use addr2line::Location;
 use capstone::{Arch, Capstone, NO_EXTRA_MODE, Mode};
 use failure::Error;
 use object::{Machine, Object, ObjectSection, SectionKind};
@@ -67,18 +66,13 @@ fn print_source_line(loc: &SourceLocation, source_lines: &mut HashMap<PathBuf, O
     Ok(())
 }
 
-fn disasm_sections<'a>(obj: &object::File<'a>, path: &Path) -> Result<(), Error> {
+fn disasm_sections<'a>(obj: &object::File<'a>, debug_obj: &object::File<'a>) -> Result<(), Error> {
     let (arch, mode) = match obj.machine() {
         Machine::X86 => (Arch::X86, Mode::Mode32),
         Machine::X86_64 => (Arch::X86, Mode::Mode64),
         _ => unimplemented!(),
     };
-    let mut map = if obj.has_debug_symbols() {
-        Mapping::new(path).or(Err(DisasmError::Addr2Line))?
-    } else {
-        let debug_file = moria::locate_debug_symbols(obj, path)?;
-        Mapping::new(debug_file).or(Err(DisasmError::Addr2Line))?
-    };
+    let map = addr2line::Context::new(debug_obj).or(Err(DisasmError::Addr2Line))?;
     let mut source_lines = HashMap::new();
     for sect in obj.sections() {
         let name = sect.name().unwrap_or("<unknown>");
@@ -87,8 +81,8 @@ fn disasm_sections<'a>(obj: &object::File<'a>, path: &Path) -> Result<(), Error>
             let cs = Capstone::new_raw(arch, mode, NO_EXTRA_MODE, None)?;
             let mut last_loc: Option<SourceLocation> = None;
             for i in cs.disasm_all(sect.data(), sect.address())?.iter() {
-                let loc = map.locate(i.address()).or(Err(DisasmError::Addr2Line))?;
-                if let Some((file, Some(line), _)) = loc {
+                let loc = map.find_location(i.address()).or(Err(DisasmError::Addr2Line))?;
+                if let Some(Location { file: Some(file), line: Some(line), .. }) = loc {
                     let this_loc = SourceLocation { file, line };
                     match last_loc {
                         None => {
@@ -125,7 +119,15 @@ pub fn disasm<P>(path: P) -> Result<(), Error>
     let buf = unsafe { memmap::Mmap::map(&f)? };
 
     let obj = object::File::parse(&*buf).map_err(|e| DisasmError::Object { reason: e } )?;
-    disasm_sections(&obj, path)
+    if obj.has_debug_symbols() {
+        disasm_sections(&obj, &obj)
+    } else {
+        let debug_path = moria::locate_debug_symbols(&obj, path)?;
+        let debug_f = File::open(debug_path)?;
+        let debug_buf = unsafe { memmap::Mmap::map(&debug_f)? };
+        let debug_obj = object::File::parse(&*debug_buf).map_err(|e| DisasmError::Object { reason: e } )?;
+        disasm_sections(&obj, &debug_obj)
+    }
 }
 
 #[cfg(test)]

@@ -5,10 +5,13 @@ version = "0.1.0"
 authors = ["Ted Mielczarek <ted@mielczarek.org>"]
 
 [dependencies]
-addr2line = "0.5.0"
+addr2line = "0.6.0"
 capstone = "0.2.0"
 failure = "0.1.1"
-goblin = "0.0.13"
 memmap = "0.6.1"
 moria = { git = "https://github.com/gimli-rs/moria/" }
-object = { git = "https://github.com/luser/object/", branch = "debug-symbols" }
+object = { git = "https://github.com/gimli-rs/object/", rev = "0fb54d82c755e317b96d4b0d57714028d05ad95c" }
+
+[replace]
+"object:0.7.0" = { git = "https://github.com/gimli-rs/object/", rev = "0fb54d82c755e317b96d4b0d57714028d05ad95c" }
+"https://github.com/luser/object/#object:0.7.0" = { git = "https://github.com/gimli-rs/object/", rev = "0fb54d82c755e317b96d4b0d57714028d05ad95c" }
