@@ -59,8 +59,8 @@ fn print_source_line(loc: &SourceLocation, source_lines: &mut HashMap<PathBuf, O
             v.insert(read_file_lines(&loc.file).ok())
         }
     } {
-        if loc.line < lines.len() as u64 {
-            println!("{:5} {}", loc.line, lines[loc.line as usize]);
+        if loc.line > 0 && loc.line <= lines.len() as u64 {
+            println!("{:5} {}", loc.line, lines[loc.line as usize - 1]);
         }
     }
     Ok(())
