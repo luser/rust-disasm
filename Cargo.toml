@@ -11,7 +11,7 @@ failure = "0.1.1"
 memmap = "0.6.1"
 moria = { git = "https://github.com/gimli-rs/moria/" }
 object = { git = "https://github.com/gimli-rs/object/", rev = "0fb54d82c755e317b96d4b0d57714028d05ad95c" }
+gimli = "0.15.0"
 
 [replace]
 "object:0.7.0" = { git = "https://github.com/gimli-rs/object/", rev = "0fb54d82c755e317b96d4b0d57714028d05ad95c" }
-"https://github.com/luser/object/#object:0.7.0" = { git = "https://github.com/gimli-rs/object/", rev = "0fb54d82c755e317b96d4b0d57714028d05ad95c" }
