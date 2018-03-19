@@ -8,13 +8,13 @@ extern crate memmap;
 #[macro_use] extern crate failure;
 
 use addr2line::{Context, Location};
-use capstone::{Arch, Capstone, NO_EXTRA_MODE, Mode};
+use capstone::{Arch, Capstone, Insn, Mode, NO_EXTRA_MODE};
 use failure::Error;
 use object::{Machine, Object, ObjectSection, SectionKind};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Fail)]
@@ -38,8 +38,8 @@ pub enum CpuArch {
 
 #[derive(Debug, PartialEq)]
 pub struct SourceLocation {
-    file: PathBuf,
-    line: u64,
+    pub file: PathBuf,
+    pub line: u64,
 }
 
 impl<'a> PartialEq<(&'a Path, u64)> for SourceLocation {
@@ -96,9 +96,40 @@ fn print_source_line(loc: &SourceLocation, source_lines: &mut HashMap<PathBuf, O
     Ok(())
 }
 
+fn format_instruction(w: &mut Write, insn: &Insn) -> Result<(), Error> {
+    // This is the number objdump uses.
+    const CHUNK_LEN: usize = 7;
+    for (i, chunk) in insn.bytes().chunks(CHUNK_LEN).enumerate() {
+        write!(w, "   {:08x}:\t", insn.address() + (i*CHUNK_LEN) as u64)?;
+        for b in chunk {
+            write!(w, "{:02x} ", b)?;
+        }
+        // Pad out bytes so they're all the same length.
+        for _ in 0..(CHUNK_LEN - chunk.len()) {
+            write!(w, "   ")?;
+        }
+        write!(w, "\t")?;
+        if i == 0 {
+            if let Some(mnemonic) = insn.mnemonic() {
+                write!(w, "{} ", mnemonic)?;
+                if let Some(op_str) = insn.op_str() {
+                    write!(w, "{}", op_str)?;
+                }
+            }
+        }
+        writeln!(w, "")?;
+    }
+    Ok(())
+}
+
+/// Print source-interleaved disassembly for the instructions in `bytes`, treating offsets as
+/// relative to `base_address`, with `arch` as the CPU architecture, `lookup` as an object that can
+/// provide source information given an address, and optionally highlighting the instruction at
+/// `highlight`.
 pub fn disasm_bytes(bytes: &[u8],
                     base_address: u64,
                     arch: CpuArch,
+                    mut highlight: Option<u64>,
                     lookup: &mut SourceLookup) -> Result<(), Error> {
     let (arch, mode) = match arch {
         CpuArch::X86 => (Arch::X86, Mode::Mode32),
@@ -107,6 +138,8 @@ pub fn disasm_bytes(bytes: &[u8],
     let mut source_lines = HashMap::new();
     let cs = Capstone::new_raw(arch, mode, NO_EXTRA_MODE, None)?;
     let mut last_loc: Option<SourceLocation> = None;
+    let mut buf = vec![];
+    let mut stdout = io::stdout();
     for i in cs.disasm_all(bytes, base_address)?.iter() {
         let loc = lookup.lookup(i.address());
         if let Some(loc) = loc {
@@ -130,7 +163,24 @@ pub fn disasm_bytes(bytes: &[u8],
         } else {
             last_loc = None;
         }
-        println!("{}", i);
+        buf.clear();
+        if let Ok(_) = format_instruction(&mut buf, &i) {
+            stdout.write_all(&buf)?;
+            match highlight {
+                Some(v) if v <= i.address() => {
+                    highlight = None;
+                    for b in buf.iter() {
+                        if *b == b'\t' {
+                            print!("\t");
+                        } else if *b != b'\n' {
+                            print!("^");
+                        }
+                    }
+                    println!("");
+                }
+                _ => {}
+            }
+        }
     }
     println!("");
     Ok(())
@@ -148,7 +198,7 @@ fn disasm_text_sections<'a>(obj: &object::File<'a>,
         let name = sect.name().unwrap_or("<unknown>");
         if sect.kind() == SectionKind::Text {
             println!("Disassembly of section {}:", name);
-            disasm_bytes(sect.data(), sect.address(), arch, &mut map)?;
+            disasm_bytes(sect.data(), sect.address(), arch, None, &mut map)?;
         }
     }
     Ok(())
@@ -163,6 +213,8 @@ fn with_file<F>(path: &Path, func: F) -> Result<(), Error>
     func(&obj)
 }
 
+/// Print source-interleaved disassembly for the instructions in any text sections in the
+/// binary file at `path`.
 pub fn disasm_file<P>(path: P) -> Result<(), Error>
     where P: AsRef<Path>,
 {
