@@ -11,6 +11,7 @@ use addr2line::{Context, Location};
 use capstone::{Arch, Capstone, Insn, Mode, NO_EXTRA_MODE};
 use failure::Error;
 use object::{Machine, Object, ObjectSection, SectionKind};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fs::File;
@@ -36,15 +37,22 @@ pub enum CpuArch {
     X86_64,
 }
 
+/// Information about the source location of an address in a program.
 #[derive(Debug, PartialEq)]
 pub struct SourceLocation {
+    /// The source file.
     pub file: PathBuf,
+    /// If present, use this for display instead of `file`.
+    pub file_display: Option<String>,
+    /// The line number within `source_file`.
     pub line: u64,
 }
 
-impl<'a> PartialEq<(&'a Path, u64)> for SourceLocation {
-    fn eq(&self, other: &(&'a Path, u64)) -> bool {
-        return self.file == other.0 && self.line == other.1;
+impl SourceLocation {
+    pub fn filename(&self) -> Cow<str> {
+        self.file_display.as_ref()
+            .map(|s| Cow::Borrowed(s.as_str()))
+            .unwrap_or_else(|| self.file.to_string_lossy())
     }
 }
 
@@ -62,7 +70,7 @@ impl<R> SourceLookup for Context<R>
             .and_then(|loc| loc)
             .and_then(|Location { file, line, .. }| {
                 if let (Some(file), Some(line)) = (file, line) {
-                    Some(SourceLocation { file, line })
+                    Some(SourceLocation { file, file_display: None, line })
                 } else {
                     None
                 }
@@ -146,12 +154,12 @@ pub fn disasm_bytes(bytes: &[u8],
             let this_loc = loc;
             match last_loc {
                 None => {
-                    println!("{}", this_loc.file.to_string_lossy());
+                    println!("{}", this_loc.filename());
                     print_source_line(&this_loc, &mut source_lines)?;
                 }
                 Some(ref last) => {
                     if last.file != this_loc.file {
-                        println!("{}", this_loc.file.to_string_lossy());
+                        println!("{}", this_loc.filename());
                     }
                     if last.line != this_loc.line {
                         print_source_line(&this_loc, &mut source_lines)?;
