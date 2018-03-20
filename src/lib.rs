@@ -1,13 +1,18 @@
 extern crate addr2line;
+extern crate atty;
 extern crate capstone;
 extern crate gimli;
 extern crate moria;
 extern crate object;
 extern crate memmap;
+#[macro_use]
+extern crate structopt;
+extern crate syntect;
 
 #[macro_use] extern crate failure;
 
 use addr2line::{Context, Location};
+use atty::Stream;
 use capstone::{Arch, Capstone, Insn, Mode, NO_EXTRA_MODE};
 use failure::Error;
 use object::{Machine, Object, ObjectSection, SectionKind};
@@ -17,6 +22,12 @@ use std::collections::hash_map::Entry;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use structopt::StructOpt;
+use syntect::util::as_24_bit_terminal_escaped;
+use syntect::easy::HighlightFile;
+use syntect::parsing::SyntaxSet;
+use syntect::highlighting::{ThemeSet, Style};
 
 #[derive(Debug, Fail)]
 pub enum DisasmError {
@@ -35,6 +46,31 @@ pub enum DisasmError {
 pub enum CpuArch {
     X86,
     X86_64,
+}
+
+/// Whether output should be colorized.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum Color {
+    /// Output colors if stdout is a terminal.
+    Auto,
+    /// Always output color.
+    Yes,
+    /// Do not output color.
+    No,
+}
+
+//TODO: use strum to get a from_str on Color.
+impl FromStr for Color {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Color, Error> {
+        Ok(match s {
+            "auto" => Color::Auto,
+            "yes" => Color::Yes,
+            "no" => Color::No,
+            _ => return Err(format_err!("Invalid --color option: {}", s)),
+        })
+    }
 }
 
 /// Information about the source location of an address in a program.
@@ -78,27 +114,50 @@ impl<R> SourceLookup for Context<R>
     }
 }
 
-fn read_file_lines<P>(path: P) -> io::Result<Vec<String>>
+fn read_file_lines<P>(path: P, color: bool) -> io::Result<Vec<String>>
     where P: AsRef<Path>,
 {
-    let f = File::open(path)?;
-    let buf = BufReader::new(f);
     let mut lines = vec![];
-    for line in buf.lines() {
-        lines.push(line?);
+    if color {
+        let ss = SyntaxSet::load_defaults_newlines();
+        let ts = ThemeSet::load_defaults();
+        let theme = ts.themes.get("base16-ocean.dark").unwrap();
+        let mut highlighter = HighlightFile::new(path, &ss, &theme)?;
+        let mut line = String::new();
+        while highlighter.reader.read_line(&mut line)? > 0 {
+            {
+                let regions: Vec<(Style, &str)> = highlighter.highlight_lines.highlight(&line);
+                let mut s = as_24_bit_terminal_escaped(&regions[..], false);
+                // Clear formatting.
+                s.push_str("\x1b[0m");
+                lines.push(s);
+            }
+            line.clear();
+        }
+    } else {
+        let f = File::open(path)?;
+        let buf = BufReader::new(f);
+        for line in buf.lines() {
+            let mut line = line?;
+            line.push('\n');
+            lines.push(line);
+        }
     }
     Ok(lines)
 }
 
-fn print_source_line(loc: &SourceLocation, source_lines: &mut HashMap<PathBuf, Option<Vec<String>>>) -> Result<(), Error> {
+fn print_source_line(loc: &SourceLocation,
+                     color: bool,
+                     source_lines: &mut HashMap<PathBuf, Option<Vec<String>>>)
+                     -> Result<(), Error> {
     if let &mut Some(ref lines) = match source_lines.entry(loc.file.clone()) {
         Entry::Occupied(o) => o.into_mut(),
         Entry::Vacant(v) => {
-            v.insert(read_file_lines(&loc.file).ok())
+            v.insert(read_file_lines(&loc.file, color).ok())
         }
     } {
         if loc.line > 0 && loc.line <= lines.len() as u64 {
-            println!("{:5} {}", loc.line, lines[loc.line as usize - 1]);
+            print!("{:5} {}", loc.line, lines[loc.line as usize - 1]);
         }
     }
     Ok(())
@@ -137,11 +196,17 @@ fn format_instruction(w: &mut Write, insn: &Insn) -> Result<(), Error> {
 pub fn disasm_bytes(bytes: &[u8],
                     base_address: u64,
                     arch: CpuArch,
+                    color: Color,
                     mut highlight: Option<u64>,
                     lookup: &mut SourceLookup) -> Result<(), Error> {
     let (arch, mode) = match arch {
         CpuArch::X86 => (Arch::X86, Mode::Mode32),
         CpuArch::X86_64 => (Arch::X86, Mode::Mode64),
+    };
+    let color = match color {
+        Color::Auto => atty::is(Stream::Stdout),
+        Color::Yes => true,
+        Color::No => false,
     };
     let mut source_lines = HashMap::new();
     let cs = Capstone::new_raw(arch, mode, NO_EXTRA_MODE, None)?;
@@ -155,14 +220,14 @@ pub fn disasm_bytes(bytes: &[u8],
             match last_loc {
                 None => {
                     println!("{}", this_loc.filename());
-                    print_source_line(&this_loc, &mut source_lines)?;
+                    print_source_line(&this_loc, color, &mut source_lines)?;
                 }
                 Some(ref last) => {
                     if last.file != this_loc.file {
                         println!("{}", this_loc.filename());
                     }
                     if last.line != this_loc.line {
-                        print_source_line(&this_loc, &mut source_lines)?;
+                        print_source_line(&this_loc, color, &mut source_lines)?;
                     }
 
                 }
@@ -195,7 +260,8 @@ pub fn disasm_bytes(bytes: &[u8],
 }
 
 fn disasm_text_sections<'a>(obj: &object::File<'a>,
-                            debug_obj: &object::File<'a>) -> Result<(), Error> {
+                            debug_obj: &object::File<'a>,
+                            color: Color) -> Result<(), Error> {
     let mut map = Context::new(debug_obj).or(Err(DisasmError::Addr2Line))?;
     let arch = match obj.machine() {
         Machine::X86 => CpuArch::X86,
@@ -206,7 +272,7 @@ fn disasm_text_sections<'a>(obj: &object::File<'a>,
         let name = sect.name().unwrap_or("<unknown>");
         if sect.kind() == SectionKind::Text {
             println!("Disassembly of section {}:", name);
-            disasm_bytes(sect.data(), sect.address(), arch, None, &mut map)?;
+            disasm_bytes(sect.data(), sect.address(), arch, color, None, &mut map)?;
         }
     }
     Ok(())
@@ -223,18 +289,32 @@ fn with_file<F>(path: &Path, func: F) -> Result<(), Error>
 
 /// Print source-interleaved disassembly for the instructions in any text sections in the
 /// binary file at `path`.
-pub fn disasm_file<P>(path: P) -> Result<(), Error>
+pub fn disasm_file<P>(path: P, color: Color) -> Result<(), Error>
     where P: AsRef<Path>,
 {
     let path = path.as_ref();
     with_file(path, |obj| {
         if obj.has_debug_symbols() {
-            disasm_text_sections(&obj, &obj)
+            disasm_text_sections(&obj, &obj, color)
         } else {
             let debug_file = moria::locate_debug_symbols(obj, path)?;
             with_file(&debug_file, |debug_obj| {
-                disasm_text_sections(&obj, &debug_obj)
+                disasm_text_sections(&obj, &debug_obj, color)
             })
         }
     })
+}
+
+#[derive(StructOpt)]
+#[structopt(name = "disasm", about = "Print source-interleaved disassembly for a binary")]
+struct Opt {
+    #[structopt(long = "color", help = "Enable colored output")]
+    color: Option<Color>,
+    #[structopt(help = "Binary to disassemble", parse(from_os_str))]
+    binary: PathBuf,
+}
+
+pub fn main() -> Result<(), Error> {
+    let opt = Opt::from_args();
+    disasm_file(&opt.binary, opt.color.unwrap_or(Color::Auto))
 }
