@@ -77,7 +77,7 @@ impl FromStr for Color {
 #[derive(Debug, PartialEq)]
 pub struct SourceLocation {
     /// The source file.
-    pub file: PathBuf,
+    pub file: String,
     /// If present, use this for display instead of `file`.
     pub file_display: Option<String>,
     /// The line number within `source_file`.
@@ -88,7 +88,7 @@ impl SourceLocation {
     pub fn filename(&self) -> Cow<str> {
         self.file_display.as_ref()
             .map(|s| Cow::Borrowed(s.as_str()))
-            .unwrap_or_else(|| self.file.to_string_lossy())
+            .unwrap_or_else(|| Cow::Borrowed(&self.file))
     }
 }
 
@@ -98,8 +98,7 @@ pub trait SourceLookup {
 
 impl<R> SourceLookup for Context<R>
     where
-    R: gimli::Reader + Sync,
-    R::Offset: Sync,
+    R: gimli::Reader,
 {
     fn lookup(&mut self, address: u64) -> Option<SourceLocation> {
         self.find_location(address).ok()
@@ -148,7 +147,7 @@ fn read_file_lines<P>(path: P, color: bool) -> io::Result<Vec<String>>
 
 fn print_source_line(loc: &SourceLocation,
                      color: bool,
-                     source_lines: &mut HashMap<PathBuf, Option<Vec<String>>>)
+                     source_lines: &mut HashMap<String, Option<Vec<String>>>)
                      -> Result<(), Error> {
     if let &mut Some(ref lines) = match source_lines.entry(loc.file.clone()) {
         Entry::Occupied(o) => o.into_mut(),
@@ -272,7 +271,7 @@ fn disasm_text_sections<'a>(obj: &object::File<'a>,
         let name = sect.name().unwrap_or("<unknown>");
         if sect.kind() == SectionKind::Text {
             println!("Disassembly of section {}:", name);
-            disasm_bytes(sect.data(), sect.address(), arch, color, None, &mut map)?;
+            disasm_bytes(sect.data().as_ref(), sect.address(), arch, color, None, &mut map)?;
         }
     }
     Ok(())
