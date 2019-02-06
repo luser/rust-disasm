@@ -210,7 +210,7 @@ pub fn disasm_bytes(bytes: &[u8],
         Color::No => false,
     };
     let mut source_lines = HashMap::new();
-    let cs = Capstone::new_raw(arch, mode, NO_EXTRA_MODE, None)?;
+    let mut cs = Capstone::new_raw(arch, mode, NO_EXTRA_MODE, None)?;
     let mut last_loc: Option<SourceLocation> = None;
     let mut buf = vec![];
     let mut stdout = io::stdout();
