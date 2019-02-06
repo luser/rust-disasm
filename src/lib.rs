@@ -46,6 +46,7 @@ pub enum DisasmError {
 pub enum CpuArch {
     X86,
     X86_64,
+    ARM64,
 }
 
 /// Whether output should be colorized.
@@ -201,6 +202,7 @@ pub fn disasm_bytes(bytes: &[u8],
     let (arch, mode) = match arch {
         CpuArch::X86 => (Arch::X86, Mode::Mode32),
         CpuArch::X86_64 => (Arch::X86, Mode::Mode64),
+        CpuArch::ARM64 => (Arch::ARM64, Mode::Default),
     };
     let color = match color {
         Color::Auto => atty::is(Stream::Stdout),
