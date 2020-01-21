@@ -6,7 +6,7 @@ authors = ["Ted Mielczarek <ted@mielczarek.org>"]
 
 [dependencies]
 addr2line = "0.7.0"
-capstone = "0.5.0"
+capstone = "0.6.0"
 failure = "0.1.1"
 memmap = "0.6.1"
 moria = { git = "https://github.com/gimli-rs/moria/", rev = "ed6d27570126e0b2b90db54bc45b5514e5918bdf"}

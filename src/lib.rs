@@ -5,7 +5,6 @@ extern crate gimli;
 extern crate moria;
 extern crate object;
 extern crate memmap;
-#[macro_use]
 extern crate structopt;
 extern crate syntect;
 
@@ -119,6 +118,7 @@ fn read_file_lines<P>(path: P, color: bool) -> io::Result<Vec<String>>
 {
     let mut lines = vec![];
     if color {
+        //TODO: move these up to a common location
         let ss = SyntaxSet::load_defaults_newlines();
         let ts = ThemeSet::load_defaults();
         let theme = ts.themes.get("base16-ocean.dark").unwrap();
@@ -163,7 +163,7 @@ fn print_source_line(loc: &SourceLocation,
     Ok(())
 }
 
-fn format_instruction(w: &mut Write, insn: &Insn) -> Result<(), Error> {
+fn format_instruction(w: &mut dyn Write, insn: &Insn) -> Result<(), Error> {
     // This is the number objdump uses.
     const CHUNK_LEN: usize = 7;
     for (i, chunk) in insn.bytes().chunks(CHUNK_LEN).enumerate() {
@@ -198,7 +198,7 @@ pub fn disasm_bytes(bytes: &[u8],
                     arch: CpuArch,
                     color: Color,
                     mut highlight: Option<u64>,
-                    lookup: &mut SourceLookup) -> Result<(), Error> {
+                    lookup: &mut dyn SourceLookup) -> Result<(), Error> {
     let (arch, mode) = match arch {
         CpuArch::X86 => (Arch::X86, Mode::Mode32),
         CpuArch::X86_64 => (Arch::X86, Mode::Mode64),
@@ -210,7 +210,7 @@ pub fn disasm_bytes(bytes: &[u8],
         Color::No => false,
     };
     let mut source_lines = HashMap::new();
-    let mut cs = Capstone::new_raw(arch, mode, NO_EXTRA_MODE, None)?;
+    let cs = Capstone::new_raw(arch, mode, NO_EXTRA_MODE, None)?;
     let mut last_loc: Option<SourceLocation> = None;
     let mut buf = vec![];
     let mut stdout = io::stdout();
