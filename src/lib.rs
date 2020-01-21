@@ -1,7 +1,6 @@
 use addr2line::{Context, Location};
 use atty::Stream;
 use capstone::{Arch, Capstone, Insn, Mode, NO_EXTRA_MODE};
-use failure::{Error, Fail, format_err};
 use object::{Machine, Object, ObjectSection, SectionKind};
 use once_cell::sync::Lazy;
 use std::borrow::Cow;
@@ -17,6 +16,7 @@ use syntect::util::as_24_bit_terminal_escaped;
 use syntect::easy::{HighlightFile, HighlightLines};
 use syntect::parsing::{Scope, SyntaxSet};
 use syntect::highlighting::{Theme, ThemeSet, Style};
+use thiserror::Error;
 
 static THEMES: Lazy<(SyntaxSet, Theme, SyntaxSet)> = Lazy::new(|| {
     let ss = SyntaxSet::load_defaults_newlines();
@@ -26,17 +26,46 @@ static THEMES: Lazy<(SyntaxSet, Theme, SyntaxSet)> = Lazy::new(|| {
     (ss, theme, asm_builtins)
 });
 
-#[derive(Debug, Fail)]
+#[derive(Debug, Error)]
 pub enum DisasmError {
-    #[fail(display = "unknown error")]
+    #[error("unknown error")]
     Unknown,
-    #[fail(display = "Bad input filename: {:?}", filename)]
-    BadFilename { filename: PathBuf },
-    #[fail(display = "addr2line error")]
+    #[error("Bad input filename: {0:?}")]
+    BadFilename(PathBuf),
+    #[error("addr2line error")]
     Addr2Line,
-    #[fail(display = "Error parsing object file: {}", reason)]
-    Object { reason: &'static str },
+    #[error("Error parsing object file: {0}")]
+    Object(&'static str),
+    #[error("{0}")]
+    InvalidArgument(String),
+    #[error("Unsupported CPU architecture {0:?}")]
+    UnsupportedArchitecture(Machine),
+    #[error("I/O error: {source:?}")]
+    Io {
+        #[from]
+        source: std::io::Error,
+    },
+    #[error("Formatting error: {source:?}")]
+    Format {
+        #[from]
+        source: std::fmt::Error,
+    },
+    #[error("Disassembly error: {source:?}")]
+    Disassembly {
+        #[from]
+        source: capstone::Error,
+    },
+    #[error("{0}")]
+    Other(Box<dyn std::error::Error>),
 }
+
+impl From<failure::Error> for DisasmError {
+    fn from(e: failure::Error) -> Self {
+        DisasmError::Other(Box::new(e.compat()))
+    }
+}
+
+pub type Result<T> = std::result::Result<T, DisasmError>;
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 #[allow(non_camel_case_types)]
@@ -59,14 +88,14 @@ pub enum Color {
 
 //TODO: use strum to get a from_str on Color.
 impl FromStr for Color {
-    type Err = Error;
+    type Err = DisasmError;
 
-    fn from_str(s: &str) -> Result<Color, Error> {
+    fn from_str(s: &str) -> Result<Color> {
         Ok(match s {
             "auto" => Color::Auto,
             "yes" => Color::Yes,
             "no" => Color::No,
-            _ => return Err(format_err!("Invalid --color option: {}", s)),
+            _ => return Err(DisasmError::InvalidArgument(format!("Invalid --color option: {}", s))),
         })
     }
 }
@@ -141,10 +170,12 @@ fn read_file_lines<P>(path: P, color: bool) -> io::Result<Vec<String>>
     Ok(lines)
 }
 
-fn print_source_line(loc: &SourceLocation,
-                     color: bool,
-                     source_lines: &mut HashMap<String, Option<Vec<String>>>)
-                     -> Result<(), Error> {
+fn print_source_line<W: Write>(
+    w: &mut W,
+    loc: &SourceLocation,
+    color: bool,
+    source_lines: &mut HashMap<String, Option<Vec<String>>>)
+    -> Result<()> {
     if let &mut Some(ref lines) = match source_lines.entry(loc.file.clone()) {
         Entry::Occupied(o) => o.into_mut(),
         Entry::Vacant(v) => {
@@ -152,13 +183,13 @@ fn print_source_line(loc: &SourceLocation,
         }
     } {
         if loc.line > 0 && loc.line <= lines.len() as u64 {
-            print!("{:5} {}", loc.line, lines[loc.line as usize - 1]);
+            write!(w, "{:5} {}", loc.line, lines[loc.line as usize - 1])?;
         }
     }
     Ok(())
 }
 
-fn format_instruction(w: &mut dyn Write, insn: &Insn, colorizer: &mut dyn FnMut(String) -> String) -> Result<(), Error> {
+fn format_instruction(w: &mut dyn Write, insn: &Insn, colorizer: &mut dyn FnMut(String) -> String) -> Result<()> {
     // This is the number objdump uses.
     const CHUNK_LEN: usize = 7;
     for (i, chunk) in insn.bytes().chunks(CHUNK_LEN).enumerate() {
@@ -195,7 +226,7 @@ pub fn disasm_bytes(bytes: &[u8],
                     arch: CpuArch,
                     color: Color,
                     mut highlight: Option<u64>,
-                    lookup: &mut dyn SourceLookup) -> Result<(), Error> {
+                    lookup: &mut dyn SourceLookup) -> Result<()> {
     let (arch, mode, scope) = match arch {
         CpuArch::X86 => (Arch::X86, Mode::Mode32, "source.asm.x86_64"),
         CpuArch::X86_64 => (Arch::X86, Mode::Mode64, "source.asm.x86_64"),
@@ -213,7 +244,7 @@ pub fn disasm_bytes(bytes: &[u8],
         let mut h = HighlightLines::new(syntax, theme);
         Box::new(move |s: String| {
             let ranges: Vec<(Style, &str)> = h.highlight(&s, asm_ss);
-            let mut s = as_24_bit_terminal_escaped(&ranges[..], true);
+            let mut s = as_24_bit_terminal_escaped(&ranges[..], false);
             s.push_str("\x1b[0m");
             s
         })
@@ -231,15 +262,15 @@ pub fn disasm_bytes(bytes: &[u8],
             let this_loc = loc;
             match last_loc {
                 None => {
-                    println!("{}", this_loc.filename());
-                    print_source_line(&this_loc, color, &mut source_lines)?;
+                    writeln!(stdout, "{}", this_loc.filename())?;
+                    print_source_line(&mut stdout, &this_loc, color, &mut source_lines)?;
                 }
                 Some(ref last) => {
                     if last.file != this_loc.file {
-                        println!("{}", this_loc.filename());
+                        writeln!(stdout, "{}", this_loc.filename())?;
                     }
                     if last.line != this_loc.line {
-                        print_source_line(&this_loc, color, &mut source_lines)?;
+                        print_source_line(&mut stdout, &this_loc, color, &mut source_lines)?;
                     }
 
                 }
@@ -256,52 +287,52 @@ pub fn disasm_bytes(bytes: &[u8],
                     highlight = None;
                     for b in buf.iter() {
                         if *b == b'\t' {
-                            print!("\t");
+                            write!(stdout, "\t")?;
                         } else if *b != b'\n' {
-                            print!("^");
+                            write!(stdout, "^")?;
                         }
                     }
-                    println!("");
+                    writeln!(stdout, "")?;
                 }
                 _ => {}
             }
         }
     }
-    println!("");
+    writeln!(stdout, "")?;
     Ok(())
 }
 
 fn disasm_text_sections<'a>(obj: &object::File<'a>,
                             debug_obj: &object::File<'a>,
-                            color: Color) -> Result<(), Error> {
+                            color: Color) -> Result<()> {
     let mut map = Context::new(debug_obj).or(Err(DisasmError::Addr2Line))?;
     let arch = match obj.machine() {
         Machine::X86 => CpuArch::X86,
         Machine::X86_64 => CpuArch::X86_64,
-        a @ _ => return Err(format_err!("Unsupported CPU architecture {:?}", a)),
+        a @ _ => return Err(DisasmError::UnsupportedArchitecture(a)),
     };
     for sect in obj.sections() {
         let name = sect.name().unwrap_or("<unknown>");
         if sect.kind() == SectionKind::Text {
-            println!("Disassembly of section {}:", name);
+            writeln!(io::stdout(), "Disassembly of section {}:", name)?;
             disasm_bytes(sect.data().as_ref(), sect.address(), arch, color, None, &mut map)?;
         }
     }
     Ok(())
 }
 
-fn with_file<F>(path: &Path, func: F) -> Result<(), Error>
-    where F: Fn(&object::File) -> Result<(), Error>
+fn with_file<F>(path: &Path, func: F) -> Result<()>
+    where F: Fn(&object::File) -> Result<()>
 {
     let f = File::open(path)?;
     let buf = unsafe { memmap::Mmap::map(&f)? };
-    let obj = object::File::parse(&*buf).map_err(|e| DisasmError::Object { reason: e } )?;
+    let obj = object::File::parse(&*buf).map_err(DisasmError::Object)?;
     func(&obj)
 }
 
 /// Print source-interleaved disassembly for the instructions in any text sections in the
 /// binary file at `path`.
-pub fn disasm_file<P>(path: P, color: Color) -> Result<(), Error>
+pub fn disasm_file<P>(path: P, color: Color) -> Result<()>
     where P: AsRef<Path>,
 {
     let path = path.as_ref();
@@ -326,7 +357,10 @@ struct Opt {
     binary: PathBuf,
 }
 
-pub fn main() -> Result<(), Error> {
+pub fn main() -> Result<()> {
     let opt = Opt::from_args();
-    disasm_file(&opt.binary, opt.color.unwrap_or(Color::Auto))
+    match disasm_file(&opt.binary, opt.color.unwrap_or(Color::Auto)) {
+        Err(DisasmError::Io { source }) if source.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        o @ _  => o,
+    }
 }
