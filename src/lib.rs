@@ -1,32 +1,30 @@
-extern crate addr2line;
-extern crate atty;
-extern crate capstone;
-extern crate gimli;
-extern crate moria;
-extern crate object;
-extern crate memmap;
-extern crate structopt;
-extern crate syntect;
-
-#[macro_use] extern crate failure;
-
 use addr2line::{Context, Location};
 use atty::Stream;
 use capstone::{Arch, Capstone, Insn, Mode, NO_EXTRA_MODE};
-use failure::Error;
+use failure::{Error, Fail, format_err};
 use object::{Machine, Object, ObjectSection, SectionKind};
+use once_cell::sync::Lazy;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use structopt::StructOpt;
 use syntect::util::as_24_bit_terminal_escaped;
-use syntect::easy::HighlightFile;
-use syntect::parsing::SyntaxSet;
-use syntect::highlighting::{ThemeSet, Style};
+use syntect::easy::{HighlightFile, HighlightLines};
+use syntect::parsing::{Scope, SyntaxSet};
+use syntect::highlighting::{Theme, ThemeSet, Style};
+
+static THEMES: Lazy<(SyntaxSet, Theme, SyntaxSet)> = Lazy::new(|| {
+    let ss = SyntaxSet::load_defaults_newlines();
+    let asm_builtins = syntect::dumps::from_binary(include_bytes!("../syntaxes.bin"));
+    let ts = ThemeSet::load_defaults();
+    let theme = ts.themes.get("base16-ocean.dark").unwrap().clone();
+    (ss, theme, asm_builtins)
+});
 
 #[derive(Debug, Fail)]
 pub enum DisasmError {
@@ -118,15 +116,12 @@ fn read_file_lines<P>(path: P, color: bool) -> io::Result<Vec<String>>
 {
     let mut lines = vec![];
     if color {
-        //TODO: move these up to a common location
-        let ss = SyntaxSet::load_defaults_newlines();
-        let ts = ThemeSet::load_defaults();
-        let theme = ts.themes.get("base16-ocean.dark").unwrap();
-        let mut highlighter = HighlightFile::new(path, &ss, &theme)?;
+        let (ref ss, ref theme, _) = *THEMES;
+        let mut highlighter = HighlightFile::new(path, ss, theme)?;
         let mut line = String::new();
         while highlighter.reader.read_line(&mut line)? > 0 {
             {
-                let regions: Vec<(Style, &str)> = highlighter.highlight_lines.highlight(&line);
+                let regions: Vec<(Style, &str)> = highlighter.highlight_lines.highlight(&line, &ss);
                 let mut s = as_24_bit_terminal_escaped(&regions[..], false);
                 // Clear formatting.
                 s.push_str("\x1b[0m");
@@ -163,7 +158,7 @@ fn print_source_line(loc: &SourceLocation,
     Ok(())
 }
 
-fn format_instruction(w: &mut dyn Write, insn: &Insn) -> Result<(), Error> {
+fn format_instruction(w: &mut dyn Write, insn: &Insn, colorizer: &mut dyn FnMut(String) -> String) -> Result<(), Error> {
     // This is the number objdump uses.
     const CHUNK_LEN: usize = 7;
     for (i, chunk) in insn.bytes().chunks(CHUNK_LEN).enumerate() {
@@ -178,10 +173,12 @@ fn format_instruction(w: &mut dyn Write, insn: &Insn) -> Result<(), Error> {
         write!(w, "\t")?;
         if i == 0 {
             if let Some(mnemonic) = insn.mnemonic() {
-                write!(w, "{} ", mnemonic)?;
+                let mut s = String::new();
+                write!(&mut s, "{} ", mnemonic)?;
                 if let Some(op_str) = insn.op_str() {
-                    write!(w, "{}", op_str)?;
+                    write!(&mut s, "{}", op_str)?;
                 }
+                write!(w, "{}", colorizer(s))?;
             }
         }
         writeln!(w, "")?;
@@ -199,15 +196,29 @@ pub fn disasm_bytes(bytes: &[u8],
                     color: Color,
                     mut highlight: Option<u64>,
                     lookup: &mut dyn SourceLookup) -> Result<(), Error> {
-    let (arch, mode) = match arch {
-        CpuArch::X86 => (Arch::X86, Mode::Mode32),
-        CpuArch::X86_64 => (Arch::X86, Mode::Mode64),
-        CpuArch::ARM64 => (Arch::ARM64, Mode::Default),
+    let (arch, mode, scope) = match arch {
+        CpuArch::X86 => (Arch::X86, Mode::Mode32, "source.asm.x86_64"),
+        CpuArch::X86_64 => (Arch::X86, Mode::Mode64, "source.asm.x86_64"),
+        CpuArch::ARM64 => (Arch::ARM64, Mode::Default, "source.asm.arm"),
     };
+    let scope = Scope::new(scope).unwrap();
     let color = match color {
         Color::Auto => atty::is(Stream::Stdout),
         Color::Yes => true,
         Color::No => false,
+    };
+    let mut asm_colorizer: Box<dyn FnMut(String) -> String> = if color {
+        let (_, ref theme, ref asm_ss) = *THEMES;
+        let syntax = asm_ss.find_syntax_by_scope(scope).unwrap();
+        let mut h = HighlightLines::new(syntax, theme);
+        Box::new(move |s: String| {
+            let ranges: Vec<(Style, &str)> = h.highlight(&s, asm_ss);
+            let mut s = as_24_bit_terminal_escaped(&ranges[..], true);
+            s.push_str("\x1b[0m");
+            s
+        })
+    } else {
+        Box::new(|s: String| s)
     };
     let mut source_lines = HashMap::new();
     let cs = Capstone::new_raw(arch, mode, NO_EXTRA_MODE, None)?;
@@ -238,7 +249,7 @@ pub fn disasm_bytes(bytes: &[u8],
             last_loc = None;
         }
         buf.clear();
-        if let Ok(_) = format_instruction(&mut buf, &i) {
+        if let Ok(_) = format_instruction(&mut buf, &i, &mut asm_colorizer) {
             stdout.write_all(&buf)?;
             match highlight {
                 Some(v) if v <= i.address() => {

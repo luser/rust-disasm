@@ -3,6 +3,7 @@
 name = "disasm"
 version = "0.1.0"
 authors = ["Ted Mielczarek <ted@mielczarek.org>"]
+edition = "2018"
 
 [dependencies]
 addr2line = "0.7.0"
@@ -12,6 +13,7 @@ memmap = "0.6.1"
 moria = { git = "https://github.com/gimli-rs/moria/", rev = "ed6d27570126e0b2b90db54bc45b5514e5918bdf"}
 object = "0.9.0"
 gimli = "0.16.0"
-syntect = "2.0.0"
+syntect = "3.3.0"
 atty = "0.2.6"
 structopt = "0.2.5"
+once_cell = "1.3.1"
