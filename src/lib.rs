@@ -1,6 +1,7 @@
 use addr2line::{Context, Location};
 use atty::Stream;
 use capstone::{Arch, Capstone, Insn, Mode, NO_EXTRA_MODE};
+use fallible_iterator::FallibleIterator;
 use object::{Machine, Object, ObjectSection, SectionKind};
 use once_cell::sync::Lazy;
 use std::borrow::Cow;
@@ -120,23 +121,33 @@ impl SourceLocation {
 }
 
 pub trait SourceLookup {
-    fn lookup(&mut self, address: u64) -> Option<SourceLocation>;
+    fn lookup<'a>(&'a mut self, address: u64) -> Box<dyn Iterator<Item=SourceLocation> + 'a>;
 }
 
 impl<R> SourceLookup for Context<R>
     where
     R: gimli::Reader,
 {
-    fn lookup(&mut self, address: u64) -> Option<SourceLocation> {
-        self.find_location(address).ok()
-            .and_then(|loc| loc)
-            .and_then(|Location { file, line, .. }| {
-                if let (Some(file), Some(line)) = (file, line) {
-                    Some(SourceLocation { file, file_display: None, line })
-                } else {
-                    None
-                }
-            })
+    fn lookup<'a>(&'a mut self, address: u64) -> Box<dyn Iterator<Item=SourceLocation> + 'a> {
+        match self.find_frames(address) {
+            Err(_) => Box::new(std::iter::empty()),
+            Ok(it) => {
+                let mut frames: Vec<SourceLocation> = it.iterator()
+                // This is an iterator whose items are Result<Option<Frame>>
+                // Frame has a location that's an Option<Location>.
+                    .filter_map(|f| f.ok().and_then(|inner| inner.location))
+                    .filter_map(|Location { file, line, .. }| {
+                        if let (Some(file), Some(line)) = (file, line) {
+                            Some(SourceLocation { file, file_display: None, line })
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                frames.reverse();
+                Box::new(frames.into_iter())
+            }
+        }
     }
 }
 
@@ -257,8 +268,8 @@ pub fn disasm_bytes(bytes: &[u8],
     let mut buf = vec![];
     let mut stdout = io::stdout();
     for i in cs.disasm_all(bytes, base_address)?.iter() {
-        let loc = lookup.lookup(i.address());
-        if let Some(loc) = loc {
+        let locs = lookup.lookup(i.address());
+        for loc in locs {
             let this_loc = loc;
             match last_loc {
                 None => {
@@ -272,12 +283,9 @@ pub fn disasm_bytes(bytes: &[u8],
                     if last.line != this_loc.line {
                         print_source_line(&mut stdout, &this_loc, color, &mut source_lines)?;
                     }
-
                 }
             }
             last_loc = Some(this_loc);
-        } else {
-            last_loc = None;
         }
         buf.clear();
         if let Ok(_) = format_instruction(&mut buf, &i, &mut asm_colorizer) {
