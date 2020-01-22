@@ -4,6 +4,8 @@ use capstone::{Arch, Capstone, Insn, Mode, NO_EXTRA_MODE};
 use fallible_iterator::FallibleIterator;
 use object::{Machine, Object, ObjectSection, SectionKind};
 use once_cell::sync::Lazy;
+#[cfg(unix)]
+use pager::Pager;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -381,7 +383,12 @@ struct Opt {
 
 pub fn main() -> Result<()> {
     let opt = Opt::from_args();
-    match disasm_file(&opt.binary, opt.color.unwrap_or(Color::Auto)) {
+    // Check for a tty before swapping it out for a pager.
+    let color = opt.color.unwrap_or_else(|| if atty::is(Stream::Stdout) { Color::Yes } else { Color::No });
+    #[cfg(unix)]
+    Pager::with_pager("less -FRSX").setup();
+
+    match disasm_file(&opt.binary, color) {
         Err(DisasmError::Io { source }) if source.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
         o @ _  => o,
     }
