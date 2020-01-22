@@ -7,6 +7,7 @@ use once_cell::sync::Lazy;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::ffi::{OsStr, OsString};
 use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
@@ -181,23 +182,36 @@ fn read_file_lines<P>(path: P, color: bool) -> io::Result<Vec<String>>
     Ok(lines)
 }
 
-fn print_source_line<W: Write>(
-    w: &mut W,
-    loc: &SourceLocation,
-    color: bool,
-    source_lines: &mut HashMap<String, Option<Vec<String>>>)
-    -> Result<()> {
-    if let &mut Some(ref lines) = match source_lines.entry(loc.file.clone()) {
-        Entry::Occupied(o) => o.into_mut(),
-        Entry::Vacant(v) => {
-            v.insert(read_file_lines(&loc.file, color).ok())
-        }
-    } {
-        if loc.line > 0 && loc.line <= lines.len() as u64 {
-            write!(w, "{:5} {}", loc.line, lines[loc.line as usize - 1])?;
+struct SourceLinePrinter {
+    source_lines: HashMap<OsString, Option<Vec<String>>>,
+}
+
+impl SourceLinePrinter {
+    pub fn new() -> Self {
+        SourceLinePrinter {
+            source_lines: HashMap::new(),
         }
     }
-    Ok(())
+
+    pub fn print_source_line<W: Write>(
+        &mut self,
+        w: &mut W,
+        loc: &SourceLocation,
+        color: bool,
+    ) -> Result<()> {
+        let f = OsStr::new(&loc.file);
+        if let &mut Some(ref lines) = match self.source_lines.entry(f.to_os_string()) {
+            Entry::Occupied(o) => o.into_mut(),
+            Entry::Vacant(v) => {
+                v.insert(read_file_lines(&f, color).ok())
+            }
+        } {
+            if loc.line > 0 && loc.line <= lines.len() as u64 {
+                write!(w, "{:5} {}", loc.line, lines[loc.line as usize - 1])?;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn format_instruction(w: &mut dyn Write, insn: &Insn, colorizer: &mut dyn FnMut(String) -> String) -> Result<()> {
@@ -262,7 +276,7 @@ pub fn disasm_bytes(bytes: &[u8],
     } else {
         Box::new(|s: String| s)
     };
-    let mut source_lines = HashMap::new();
+    let mut source_printer = SourceLinePrinter::new();
     let cs = Capstone::new_raw(arch, mode, NO_EXTRA_MODE, None)?;
     let mut last_loc: Option<SourceLocation> = None;
     let mut buf = vec![];
@@ -274,14 +288,14 @@ pub fn disasm_bytes(bytes: &[u8],
             match last_loc {
                 None => {
                     writeln!(stdout, "{}", this_loc.filename())?;
-                    print_source_line(&mut stdout, &this_loc, color, &mut source_lines)?;
+                    source_printer.print_source_line(&mut stdout, &this_loc, color)?;
                 }
                 Some(ref last) => {
                     if last.file != this_loc.file {
                         writeln!(stdout, "{}", this_loc.filename())?;
                     }
                     if last.line != this_loc.line {
-                        print_source_line(&mut stdout, &this_loc, color, &mut source_lines)?;
+                        source_printer.print_source_line(&mut stdout, &this_loc, color)?;
                     }
                 }
             }
