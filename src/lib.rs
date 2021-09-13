@@ -7,8 +7,8 @@ use once_cell::sync::Lazy;
 #[cfg(unix)]
 use pager::Pager;
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as FmtWrite;
 use std::fs::File;
@@ -16,10 +16,10 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use structopt::StructOpt;
-use syntect::util::as_24_bit_terminal_escaped;
 use syntect::easy::{HighlightFile, HighlightLines};
+use syntect::highlighting::{Style, Theme, ThemeSet};
 use syntect::parsing::{Scope, SyntaxSet};
-use syntect::highlighting::{Theme, ThemeSet, Style};
+use syntect::util::as_24_bit_terminal_escaped;
 use thiserror::Error;
 
 static THEMES: Lazy<(SyntaxSet, Theme, SyntaxSet)> = Lazy::new(|| {
@@ -99,7 +99,12 @@ impl FromStr for Color {
             "auto" => Color::Auto,
             "yes" => Color::Yes,
             "no" => Color::No,
-            _ => return Err(DisasmError::InvalidArgument(format!("Invalid --color option: {}", s))),
+            _ => {
+                return Err(DisasmError::InvalidArgument(format!(
+                    "Invalid --color option: {}",
+                    s
+                )))
+            }
         })
     }
 }
@@ -117,31 +122,37 @@ pub struct SourceLocation {
 
 impl SourceLocation {
     pub fn filename(&self) -> Cow<str> {
-        self.file_display.as_ref()
+        self.file_display
+            .as_ref()
             .map(|s| Cow::Borrowed(s.as_str()))
             .unwrap_or_else(|| Cow::Borrowed(&self.file))
     }
 }
 
 pub trait SourceLookup {
-    fn lookup<'a>(&'a mut self, address: u64) -> Box<dyn Iterator<Item=SourceLocation> + 'a>;
+    fn lookup<'a>(&'a mut self, address: u64) -> Box<dyn Iterator<Item = SourceLocation> + 'a>;
 }
 
 impl<R> SourceLookup for Context<R>
-    where
+where
     R: gimli::Reader,
 {
-    fn lookup<'a>(&'a mut self, address: u64) -> Box<dyn Iterator<Item=SourceLocation> + 'a> {
+    fn lookup<'a>(&'a mut self, address: u64) -> Box<dyn Iterator<Item = SourceLocation> + 'a> {
         match self.find_frames(address) {
             Err(_) => Box::new(std::iter::empty()),
             Ok(it) => {
-                let mut frames: Vec<SourceLocation> = it.iterator()
-                // This is an iterator whose items are Result<Option<Frame>>
-                // Frame has a location that's an Option<Location>.
+                let mut frames: Vec<SourceLocation> = it
+                    .iterator()
+                    // This is an iterator whose items are Result<Option<Frame>>
+                    // Frame has a location that's an Option<Location>.
                     .filter_map(|f| f.ok().and_then(|inner| inner.location))
                     .filter_map(|Location { file, line, .. }| {
                         if let (Some(file), Some(line)) = (file, line) {
-                            Some(SourceLocation { file, file_display: None, line })
+                            Some(SourceLocation {
+                                file,
+                                file_display: None,
+                                line,
+                            })
                         } else {
                             None
                         }
@@ -155,7 +166,8 @@ impl<R> SourceLookup for Context<R>
 }
 
 fn read_file_lines<P>(path: P, color: bool) -> io::Result<Vec<String>>
-    where P: AsRef<Path>,
+where
+    P: AsRef<Path>,
 {
     let mut lines = vec![];
     if color {
@@ -204,9 +216,7 @@ impl SourceLinePrinter {
         let f = OsStr::new(&loc.file);
         if let &mut Some(ref lines) = match self.source_lines.entry(f.to_os_string()) {
             Entry::Occupied(o) => o.into_mut(),
-            Entry::Vacant(v) => {
-                v.insert(read_file_lines(&f, color).ok())
-            }
+            Entry::Vacant(v) => v.insert(read_file_lines(&f, color).ok()),
         } {
             if loc.line > 0 && loc.line <= lines.len() as u64 {
                 write!(w, "{:5} {}", loc.line, lines[loc.line as usize - 1])?;
@@ -216,11 +226,15 @@ impl SourceLinePrinter {
     }
 }
 
-fn format_instruction(w: &mut dyn Write, insn: &Insn, colorizer: &mut dyn FnMut(String) -> String) -> Result<()> {
+fn format_instruction(
+    w: &mut dyn Write,
+    insn: &Insn,
+    colorizer: &mut dyn FnMut(String) -> String,
+) -> Result<()> {
     // This is the number objdump uses.
     const CHUNK_LEN: usize = 7;
     for (i, chunk) in insn.bytes().chunks(CHUNK_LEN).enumerate() {
-        write!(w, "   {:08x}:\t", insn.address() + (i*CHUNK_LEN) as u64)?;
+        write!(w, "   {:08x}:\t", insn.address() + (i * CHUNK_LEN) as u64)?;
         for b in chunk {
             write!(w, "{:02x} ", b)?;
         }
@@ -248,12 +262,14 @@ fn format_instruction(w: &mut dyn Write, insn: &Insn, colorizer: &mut dyn FnMut(
 /// relative to `base_address`, with `arch` as the CPU architecture, `lookup` as an object that can
 /// provide source information given an address, and optionally highlighting the instruction at
 /// `highlight`.
-pub fn disasm_bytes(bytes: &[u8],
-                    base_address: u64,
-                    arch: CpuArch,
-                    color: Color,
-                    mut highlight: Option<u64>,
-                    lookup: &mut dyn SourceLookup) -> Result<()> {
+pub fn disasm_bytes(
+    bytes: &[u8],
+    base_address: u64,
+    arch: CpuArch,
+    color: Color,
+    mut highlight: Option<u64>,
+    lookup: &mut dyn SourceLookup,
+) -> Result<()> {
     let (arch, mode, scope) = match arch {
         CpuArch::X86 => (Arch::X86, Mode::Mode32, "source.asm.x86_64"),
         CpuArch::X86_64 => (Arch::X86, Mode::Mode64, "source.asm.x86_64"),
@@ -326,9 +342,11 @@ pub fn disasm_bytes(bytes: &[u8],
     Ok(())
 }
 
-fn disasm_text_sections<'a>(obj: &object::File<'a>,
-                            debug_obj: &object::File<'a>,
-                            color: Color) -> Result<()> {
+fn disasm_text_sections<'a>(
+    obj: &object::File<'a>,
+    debug_obj: &object::File<'a>,
+    color: Color,
+) -> Result<()> {
     let mut map = Context::new(debug_obj).or(Err(DisasmError::Addr2Line))?;
     let arch = match obj.machine() {
         Machine::X86 => CpuArch::X86,
@@ -339,14 +357,22 @@ fn disasm_text_sections<'a>(obj: &object::File<'a>,
         let name = sect.name().unwrap_or("<unknown>");
         if sect.kind() == SectionKind::Text {
             writeln!(io::stdout(), "Disassembly of section {}:", name)?;
-            disasm_bytes(sect.data().as_ref(), sect.address(), arch, color, None, &mut map)?;
+            disasm_bytes(
+                sect.data().as_ref(),
+                sect.address(),
+                arch,
+                color,
+                None,
+                &mut map,
+            )?;
         }
     }
     Ok(())
 }
 
 fn with_file<F>(path: &Path, func: F) -> Result<()>
-    where F: Fn(&object::File) -> Result<()>
+where
+    F: Fn(&object::File) -> Result<()>,
 {
     let f = File::open(path)?;
     let buf = unsafe { memmap::Mmap::map(&f)? };
@@ -357,7 +383,8 @@ fn with_file<F>(path: &Path, func: F) -> Result<()>
 /// Print source-interleaved disassembly for the instructions in any text sections in the
 /// binary file at `path`.
 pub fn disasm_file<P>(path: P, color: Color) -> Result<()>
-    where P: AsRef<Path>,
+where
+    P: AsRef<Path>,
 {
     let path = path.as_ref();
     with_file(path, |obj| {
@@ -373,7 +400,10 @@ pub fn disasm_file<P>(path: P, color: Color) -> Result<()>
 }
 
 #[derive(StructOpt)]
-#[structopt(name = "disasm", about = "Print source-interleaved disassembly for a binary")]
+#[structopt(
+    name = "disasm",
+    about = "Print source-interleaved disassembly for a binary"
+)]
 struct Opt {
     #[structopt(long = "color", help = "Enable colored output")]
     color: Option<Color>,
@@ -384,12 +414,20 @@ struct Opt {
 pub fn main() -> Result<()> {
     let opt = Opt::from_args();
     // Check for a tty before swapping it out for a pager.
-    let color = opt.color.unwrap_or_else(|| if atty::is(Stream::Stdout) { Color::Yes } else { Color::No });
+    let color = opt.color.unwrap_or_else(|| {
+        if atty::is(Stream::Stdout) {
+            Color::Yes
+        } else {
+            Color::No
+        }
+    });
     #[cfg(unix)]
     Pager::with_pager("less -FRSX").setup();
 
     match disasm_file(&opt.binary, color) {
-        Err(DisasmError::Io { source }) if source.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
-        o @ _  => o,
+        Err(DisasmError::Io { source }) if source.kind() == std::io::ErrorKind::BrokenPipe => {
+            Ok(())
+        }
+        o @ _ => o,
     }
 }
