@@ -1,8 +1,7 @@
 use addr2line::{Context, Location};
 use atty::Stream;
-use capstone::{Arch, Capstone, Insn, Mode, NO_EXTRA_MODE};
 use fallible_iterator::FallibleIterator;
-use object::{Machine, Object, ObjectSection, SectionKind};
+use object::{self, Architecture, Object, ObjectSection, SectionKind};
 use once_cell::sync::Lazy;
 #[cfg(unix)]
 use pager::Pager;
@@ -10,7 +9,6 @@ use std::borrow::Cow;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
-use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -21,6 +19,8 @@ use syntect::highlighting::{Style, Theme, ThemeSet};
 use syntect::parsing::{Scope, SyntaxSet};
 use syntect::util::as_24_bit_terminal_escaped;
 use thiserror::Error;
+use yaxpeax_arch::{AddressBase, Arch, DecodeError, Decoder, LengthedInstruction, Reader, U8Reader};
+use num_traits::identities::Zero;
 
 static THEMES: Lazy<(SyntaxSet, Theme, SyntaxSet)> = Lazy::new(|| {
     let ss = SyntaxSet::load_defaults_newlines();
@@ -36,14 +36,19 @@ pub enum DisasmError {
     Unknown,
     #[error("Bad input filename: {0:?}")]
     BadFilename(PathBuf),
+    #[error("Couldn't locate debug symbols for {0:?}")]
+    NoDebugSymbols(PathBuf),
     #[error("addr2line error")]
     Addr2Line,
-    #[error("Error parsing object file: {0}")]
-    Object(&'static str),
+    #[error("Error parsing object file: {source}")]
+    Object {
+        #[from]
+        source: object::Error,
+    },
     #[error("{0}")]
     InvalidArgument(String),
     #[error("Unsupported CPU architecture {0:?}")]
-    UnsupportedArchitecture(Machine),
+    UnsupportedArchitecture(Architecture),
     #[error("I/O error: {source:?}")]
     Io {
         #[from]
@@ -54,11 +59,8 @@ pub enum DisasmError {
         #[from]
         source: std::fmt::Error,
     },
-    #[error("Disassembly error: {source:?}")]
-    Disassembly {
-        #[from]
-        source: capstone::Error,
-    },
+    #[error("Disassembly error: {0}")]
+    Disassembly(&'static str),
     #[error("{0}")]
     Other(Box<dyn std::error::Error>),
 }
@@ -66,6 +68,24 @@ pub enum DisasmError {
 impl From<failure::Error> for DisasmError {
     fn from(e: failure::Error) -> Self {
         DisasmError::Other(Box::new(e.compat()))
+    }
+}
+
+impl From<yaxpeax_arm::armv8::a64::DecodeError> for DisasmError {
+    fn from(e: yaxpeax_arm::armv8::a64::DecodeError) -> Self {
+        DisasmError::Disassembly(e.description())
+    }
+}
+
+impl From<yaxpeax_x86::amd64::DecodeError> for DisasmError {
+    fn from(e: yaxpeax_x86::amd64::DecodeError) -> Self {
+        DisasmError::Disassembly(e.description())
+    }
+}
+
+impl From<yaxpeax_x86::protected_mode::DecodeError> for DisasmError {
+    fn from(e: yaxpeax_x86::protected_mode::DecodeError) -> Self {
+        DisasmError::Disassembly(e.description())
     }
 }
 
@@ -117,7 +137,7 @@ pub struct SourceLocation {
     /// If present, use this for display instead of `file`.
     pub file_display: Option<String>,
     /// The line number within `source_file`.
-    pub line: u64,
+    pub line: u32,
 }
 
 impl SourceLocation {
@@ -149,7 +169,7 @@ where
                     .filter_map(|Location { file, line, .. }| {
                         if let (Some(file), Some(line)) = (file, line) {
                             Some(SourceLocation {
-                                file,
+                                file: file.to_owned(),
                                 file_display: None,
                                 line,
                             })
@@ -218,7 +238,7 @@ impl SourceLinePrinter {
             Entry::Occupied(o) => o.into_mut(),
             Entry::Vacant(v) => v.insert(read_file_lines(&f, color).ok()),
         } {
-            if loc.line > 0 && loc.line <= lines.len() as u64 {
+            if loc.line > 0 && loc.line <= lines.len() as u32 {
                 write!(w, "{:5} {}", loc.line, lines[loc.line as usize - 1])?;
             }
         }
@@ -228,13 +248,16 @@ impl SourceLinePrinter {
 
 fn format_instruction(
     w: &mut dyn Write,
-    insn: &Insn,
+    insn: String,
+    address: u64,
+    bytes: &[u8],
     colorizer: &mut dyn FnMut(String) -> String,
 ) -> Result<()> {
     // This is the number objdump uses.
     const CHUNK_LEN: usize = 7;
-    for (i, chunk) in insn.bytes().chunks(CHUNK_LEN).enumerate() {
-        write!(w, "   {:08x}:\t", insn.address() + (i * CHUNK_LEN) as u64)?;
+    for (i, chunk) in bytes.chunks(CHUNK_LEN).enumerate() {
+        let current = address + (i * CHUNK_LEN) as u64;
+        write!(w, "   {:08x}:\t", current)?;
         for b in chunk {
             write!(w, "{:02x} ", b)?;
         }
@@ -244,14 +267,7 @@ fn format_instruction(
         }
         write!(w, "\t")?;
         if i == 0 {
-            if let Some(mnemonic) = insn.mnemonic() {
-                let mut s = String::new();
-                write!(&mut s, "{} ", mnemonic)?;
-                if let Some(op_str) = insn.op_str() {
-                    write!(&mut s, "{}", op_str)?;
-                }
-                write!(w, "{}", colorizer(s))?;
-            }
+            write!(w, "{}", colorizer(insn.clone()))?;
         }
         writeln!(w, "")?;
     }
@@ -267,15 +283,53 @@ pub fn disasm_bytes(
     base_address: u64,
     arch: CpuArch,
     color: Color,
-    mut highlight: Option<u64>,
+    highlight: Option<u64>,
     lookup: &mut dyn SourceLookup,
 ) -> Result<()> {
-    let (arch, mode, scope) = match arch {
-        CpuArch::X86 => (Arch::X86, Mode::Mode32, "source.asm.x86_64"),
-        CpuArch::X86_64 => (Arch::X86, Mode::Mode64, "source.asm.x86_64"),
-        CpuArch::ARM64 => (Arch::ARM64, Mode::Default, "source.asm.arm"),
-    };
-    let scope = Scope::new(scope).unwrap();
+    match arch {
+        CpuArch::X86 => disasm_bytes_arch::<yaxpeax_x86::protected_mode::Arch>(
+            bytes,
+            base_address as u32,
+            color,
+            highlight,
+            lookup,
+            "source.asm.x86_64",
+        ),
+        CpuArch::X86_64 => disasm_bytes_arch::<yaxpeax_x86::amd64::Arch>(
+            bytes,
+            base_address,
+            color,
+            highlight,
+            lookup,
+            "source.asm.x86_64",
+        ),
+        CpuArch::ARM64 => disasm_bytes_arch::<yaxpeax_arm::armv8::a64::ARMv8>(
+            bytes,
+            base_address,
+            color,
+            highlight,
+            lookup,
+            "source.asm.arm",
+        ),
+    }
+}
+
+fn disasm_bytes_arch<A>(
+    bytes: &[u8],
+    base_address: A::Address,
+    color: Color,
+    mut highlight: Option<u64>,
+    lookup: &mut dyn SourceLookup,
+    asm_scope: &'static str,
+) -> Result<()>
+where
+    A: Arch,
+    A::Instruction: std::fmt::Display,
+    A::Address: Into<u64>,
+    DisasmError: From<A::DecodeError>,
+    for<'data> U8Reader<'data>: Reader<A::Address, A::Word>,
+{
+    let scope = Scope::new(asm_scope).unwrap();
     let color = match color {
         Color::Auto => atty::is(Stream::Stdout),
         Color::Yes => true,
@@ -295,12 +349,18 @@ pub fn disasm_bytes(
         Box::new(|s: String| s)
     };
     let mut source_printer = SourceLinePrinter::new();
-    let cs = Capstone::new_raw(arch, mode, NO_EXTRA_MODE, None)?;
+    let mut reader = U8Reader::new(bytes);
+    let mut inst_offset = reader.total_offset();
+    let decoder = A::Decoder::default();
+    let mut decode_res = decoder.decode(&mut reader);
+    let mut address = A::Address::zero();
     let mut last_loc: Option<SourceLocation> = None;
     let mut buf = vec![];
     let mut stdout = io::stdout();
-    for i in cs.disasm_all(bytes, base_address)?.iter() {
-        let locs = lookup.lookup(i.address());
+    loop {
+        let inst = decode_res?;
+        let abs_address = address + base_address;
+        let locs = lookup.lookup(abs_address.into());
         for loc in locs {
             let this_loc = loc;
             match last_loc {
@@ -320,10 +380,17 @@ pub fn disasm_bytes(
             last_loc = Some(this_loc);
         }
         buf.clear();
-        if let Ok(_) = format_instruction(&mut buf, &i, &mut asm_colorizer) {
+        let inst_bytes = &bytes[inst_offset.to_linear()..(inst_offset + inst.len()).to_linear()];
+        if let Ok(_) = format_instruction(
+            &mut buf,
+            inst.to_string(),
+            abs_address.into(),
+            inst_bytes,
+            &mut asm_colorizer,
+        ) {
             stdout.write_all(&buf)?;
             match highlight {
-                Some(v) if v <= i.address() => {
+                Some(v) if v <= address.to_linear() as u64 => {
                     highlight = None;
                     for b in buf.iter() {
                         if *b == b'\t' {
@@ -337,6 +404,12 @@ pub fn disasm_bytes(
                 _ => {}
             }
         }
+        address += inst.len();
+        if address.to_linear() >= bytes.len() {
+            break;
+        }
+        decode_res = decoder.decode(&mut reader);
+        inst_offset = reader.total_offset();
     }
     writeln!(stdout, "")?;
     Ok(())
@@ -348,9 +421,10 @@ fn disasm_text_sections<'a>(
     color: Color,
 ) -> Result<()> {
     let mut map = Context::new(debug_obj).or(Err(DisasmError::Addr2Line))?;
-    let arch = match obj.machine() {
-        Machine::X86 => CpuArch::X86,
-        Machine::X86_64 => CpuArch::X86_64,
+    let arch = match obj.architecture() {
+        Architecture::I386 => CpuArch::X86,
+        Architecture::X86_64 => CpuArch::X86_64,
+        Architecture::Aarch64 => CpuArch::ARM64,
         a @ _ => return Err(DisasmError::UnsupportedArchitecture(a)),
     };
     for sect in obj.sections() {
@@ -358,7 +432,7 @@ fn disasm_text_sections<'a>(
         if sect.kind() == SectionKind::Text {
             writeln!(io::stdout(), "Disassembly of section {}:", name)?;
             disasm_bytes(
-                sect.data().as_ref(),
+                sect.data()?.as_ref(),
                 sect.address(),
                 arch,
                 color,
@@ -376,7 +450,7 @@ where
 {
     let f = File::open(path)?;
     let buf = unsafe { memmap::Mmap::map(&f)? };
-    let obj = object::File::parse(&*buf).map_err(DisasmError::Object)?;
+    let obj = object::File::parse(&*buf)?;
     func(&obj)
 }
 
@@ -388,10 +462,11 @@ where
 {
     let path = path.as_ref();
     with_file(path, |obj| {
-        if obj.has_debug_symbols() {
+        let debug_file_res = locate_dwarf::locate_debug_symbols(obj, path);
+        if obj.has_debug_symbols() || match debug_file_res { Err(_) | Ok(None) => true, _ => false } {
             disasm_text_sections(&obj, &obj, color)
         } else {
-            let debug_file = moria::locate_debug_symbols(obj, path)?;
+            let debug_file: PathBuf = debug_file_res.ok().flatten().ok_or_else(|| DisasmError::NoDebugSymbols(path.to_owned()))?;
             with_file(&debug_file, |debug_obj| {
                 disasm_text_sections(&obj, &debug_obj, color)
             })
