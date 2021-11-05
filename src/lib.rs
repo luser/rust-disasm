@@ -349,7 +349,7 @@ fn with_file<F>(path: &Path, func: F) -> Result<()>
     where F: Fn(&object::File) -> Result<()>
 {
     let f = File::open(path)?;
-    let buf = unsafe { memmap::Mmap::map(&f)? };
+    let buf = unsafe { memmap2::Mmap::map(&f)? };
     let obj = object::File::parse(&*buf).map_err(DisasmError::Object)?;
     func(&obj)
 }
