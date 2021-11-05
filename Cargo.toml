@@ -10,8 +10,8 @@ addr2line = "0.7.0"
 capstone = "0.6.0"
 failure = "0.1.1"
 fallible-iterator = "0.1"
-memmap = "0.6.1"
-moria = { git = "https://github.com/gimli-rs/moria/", rev = "ed6d27570126e0b2b90db54bc45b5514e5918bdf"}
+memmap2 = "0.5.0"
+moria = { git = "https://github.com/gimli-rs/moria/", rev = "ed6d27570126e0b2b90db54bc45b5514e5918bdf" }
 object = "0.9.0"
 gimli = "0.16.0"
 syntect = "3.3.0"
